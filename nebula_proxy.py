@@ -1,38 +1,34 @@
 #!/usr/bin/env python3
-"""SillyTavern <-> Nebula Proxy (v2 — Direct Agent DM)
+"""SillyTavern <-> Nebula Proxy (v4 — Ephemeral Threads)
 
 A lightweight reverse proxy that lets SillyTavern use Nebula as its AI backend.
 
 Architecture:
     SillyTavern sends OpenAI-format chat completion requests to this proxy.
-    The proxy opens a DM thread with a specific Nebula agent, sends the
-    conversation as a single prompt, polls for the agent's response, and
-    returns it in OpenAI-compatible format.
+    For EACH request, the proxy:
+      1. Creates a fresh DM thread with the Nebula roleplay agent
+      2. Sends the full conversation as a single prompt
+      3. Polls the /events endpoint for the completed assistant response
+      4. Returns the response in OpenAI format
+      5. Deletes the ephemeral thread (fire-and-forget cleanup)
 
-    Messages go directly to the sillytavern-roleplay agent — not to the
-    main Nebula orchestrator. This keeps roleplay traffic isolated.
+    This means the Nebula agent is completely STATELESS between requests.
+    It only sees what SillyTavern sends in the messages array each time,
+    with zero Nebula-side context bleed between sessions.
 
-    No webhooks, no callbacks, no async task chains. Just direct API calls.
+SillyTavern Setup:
+    1. In SillyTavern, go to API Connections
+    2. Select "Chat Completion" API type, "OpenAI" source
+    3. Set Custom Endpoint: http://localhost:5001/v1
+    4. Any API key will work (the proxy ignores it)
+    5. Model: "nebula" (or anything — it's ignored)
 
-Auth:
-    The Nebula API uses a Bearer JWT token for authentication. To get yours:
-    1. Log into nebula.gg
-    2. Open Chrome DevTools (F12) -> Network tab -> filter XHR
-    3. Send any message and click one of the api.nebula.gg requests
-    4. Copy the Authorization header value (after "Bearer ")
-
-    NOTE: This JWT expires after ~30 days. When it stops working, repeat the
-    steps above to get a fresh token.
-
-Setup:
-    1. pip install flask requests python-dotenv
-    2. Create a .env file with:
-         NEBULA_BEARER_TOKEN=eyJhb...<your JWT from Chrome DevTools>
-         NEBULA_AGENT_ID=agt_069ae0c0325978858000e7d919400eff
-         PROXY_PORT=5001
-    3. python nebula_proxy.py
-    4. In SillyTavern, set the API to "Chat Completion (OpenAI)"
-       and point it at http://localhost:5001
+Environment Variables:
+    NEBULA_BEARER_TOKEN  - JWT from browser cookies (required)
+    NEBULA_AGENT_ID      - Target agent ID (default: sillytavern-roleplay agent)
+    PROXY_PORT           - Port to listen on (default: 5001)
+    POLL_INTERVAL        - Seconds between polls (default: 2.5)
+    POLL_TIMEOUT         - Max seconds to wait for response (default: 300)
 """
 
 import json
@@ -57,8 +53,8 @@ NEBULA_AGENT_ID = os.getenv(
 PROXY_PORT = int(os.getenv("PROXY_PORT", "5001"))
 
 # Polling settings
-POLL_INTERVAL = float(os.getenv("POLL_INTERVAL", "2.0"))  # seconds between polls
-POLL_TIMEOUT = float(os.getenv("POLL_TIMEOUT", "300"))    # max wait time
+POLL_INTERVAL = float(os.getenv("POLL_INTERVAL", "2.5"))  # seconds between polls
+POLL_TIMEOUT = float(os.getenv("POLL_TIMEOUT", "300"))     # max wait time
 
 # ---- Logging ----------------------------------------------------------------
 
@@ -73,59 +69,81 @@ logger = logging.getLogger("nebula-proxy")
 
 app = Flask(__name__)
 
-# ---- State ------------------------------------------------------------------
-
-_dm_thread_id: str | None = None  # cached DM thread ID
-
 
 # ---- API Helpers ------------------------------------------------------------
 
 def _headers() -> dict:
     """Standard headers for Nebula API requests."""
     return {
-        "Content-Type": "application/json",
         "Authorization": f"Bearer {NEBULA_BEARER_TOKEN}",
-        "x-user-timezone": "America/New_York",
+        "Content-Type": "application/json",
+        "Accept": "application/json",
     }
 
 
-def _get_dm_thread() -> str:
-    """Get or create a DM thread with the roleplay agent.
+def _create_fresh_thread() -> str:
+    """Create a brand-new ephemeral DM thread with the roleplay agent.
 
-    Uses GET /agents/{agent_id}/dm which returns (or creates) a thread
-    where is_agent_dm=true and target_agent_id points to our agent.
-    The result is cached for the lifetime of the process.
+    Calls POST /threads with target_agent_id to create a single-agent DM.
+    Each SillyTavern request gets its own thread so the agent starts fresh
+    with no prior Nebula-side context.
+
+    Returns:
+        The new thread ID string.
     """
-    global _dm_thread_id
-    if _dm_thread_id:
-        return _dm_thread_id
+    session_tag = uuid.uuid4().hex[:8]
+    title = f"st-session-{session_tag}"
 
-    logger.info("Getting DM thread with agent %s...", NEBULA_AGENT_ID)
-    resp = http_requests.get(
-        f"{NEBULA_API_BASE}/agents/{NEBULA_AGENT_ID}/dm",
+    logger.info("Creating fresh thread '%s' for agent %s...", title, NEBULA_AGENT_ID)
+
+    resp = http_requests.post(
+        f"{NEBULA_API_BASE}/threads",
         headers=_headers(),
+        json={
+            "title": title,
+            "target_agent_id": NEBULA_AGENT_ID,
+            "extended_thinking_enabled": False,
+            "source": "api",
+        },
         timeout=30,
     )
     resp.raise_for_status()
     data = resp.json()
 
-    # The response is {"result": {"id": "thrd_...", ...}}
+    # Response: {"result": {"id": "thrd_...", ...}}
     result = data.get("result", data)
-    thread_id = result.get("id") or result.get("thread_id")
+    thread_id = result.get("id", "")
 
     if not thread_id:
-        raise ValueError(
-            f"Could not extract thread ID from DM response: "
-            f"{json.dumps(data)[:500]}"
-        )
+        raise RuntimeError(f"No thread ID in create response: {data}")
 
-    _dm_thread_id = thread_id
-    logger.info(
-        "DM thread ready: %s (is_agent_dm=%s)",
-        thread_id,
-        result.get("is_agent_dm"),
-    )
+    logger.info("Created ephemeral thread: %s ('%s')", thread_id, title)
     return thread_id
+
+
+def _delete_thread(thread_id: str) -> None:
+    """Delete an ephemeral thread after use (fire-and-forget cleanup).
+
+    Calls DELETE /threads/{thread_id}. Errors are logged but never raised,
+    so cleanup failures don't affect the response to SillyTavern.
+    """
+    try:
+        logger.info("Cleaning up thread %s...", thread_id)
+        resp = http_requests.delete(
+            f"{NEBULA_API_BASE}/threads/{thread_id}",
+            headers=_headers(),
+            timeout=15,
+        )
+        if resp.ok:
+            logger.info("Thread %s deleted.", thread_id)
+        else:
+            logger.warning(
+                "Thread cleanup returned %d: %s",
+                resp.status_code,
+                resp.text[:200],
+            )
+    except Exception as e:
+        logger.warning("Thread cleanup failed (non-fatal): %s", e)
 
 
 # ---- Message Formatting -----------------------------------------------------
@@ -133,62 +151,60 @@ def _get_dm_thread() -> str:
 def _format_messages_for_nebula(messages: list) -> str:
     """Convert OpenAI-format messages array into a single prompt for Nebula.
 
-    SillyTavern sends the full conversation as an array of messages with roles
-    (system, user, assistant). We concatenate them into a structured prompt
-    that the Nebula agent can understand and roleplay from.
+    SillyTavern sends the full conversation history including system prompts,
+    character cards, and user/assistant turns. We concatenate them into one
+    message since Nebula threads accept a single message string.
     """
     parts = []
-
     for msg in messages:
         role = msg.get("role", "user")
         content = msg.get("content", "")
 
-        if not content or not content.strip():
-            continue
-
         if role == "system":
             parts.append(f"[System Instructions]\n{content}")
-        elif role == "user":
-            parts.append(f"[User]\n{content}")
         elif role == "assistant":
             parts.append(f"[Assistant]\n{content}")
+        elif role == "user":
+            parts.append(f"[User]\n{content}")
         else:
             parts.append(f"[{role}]\n{content}")
 
-    return "\n\n---\n\n".join(parts)
+    return "\n\n".join(parts)
+
+
+def _extract_text_from_content(content) -> str:
+    """Extract plain text from a NebulaMessageEvent content field.
+
+    The content field can be:
+    - A simple string (from /messages endpoint)
+    - An array of ChatContentType objects (from /events endpoint)
+      Each object may have {"type": "text", "text": "..."} or similar
+    - None/empty
+    """
+    if isinstance(content, str):
+        return content.strip()
+
+    if isinstance(content, list):
+        text_parts = []
+        for item in content:
+            if isinstance(item, str):
+                text_parts.append(item)
+            elif isinstance(item, dict):
+                # Try common content object shapes
+                text = (
+                    item.get("text")
+                    or item.get("content")
+                    or item.get("value")
+                    or ""
+                )
+                if text:
+                    text_parts.append(str(text))
+        return "\n".join(text_parts).strip()
+
+    return str(content).strip() if content else ""
 
 
 # ---- Nebula API Interaction -------------------------------------------------
-
-def _get_existing_message_ids(thread_id: str, limit: int = 10) -> set:
-    """Fetch recent message IDs from the thread (for change detection)."""
-    try:
-        resp = http_requests.get(
-            f"{NEBULA_API_BASE}/threads/{thread_id}/messages",
-            headers=_headers(),
-            params={"limit": limit},
-            timeout=30,
-        )
-        resp.raise_for_status()
-        data = resp.json()
-
-        messages = []
-        if isinstance(data, list):
-            messages = data
-        elif isinstance(data, dict):
-            messages = data.get("messages", data.get("items", data.get("data", [])))
-
-        ids = set()
-        for msg in messages:
-            msg_id = msg.get("id") or msg.get("message_id")
-            if msg_id:
-                ids.add(msg_id)
-        return ids
-
-    except Exception as e:
-        logger.warning("Failed to fetch existing messages: %s", e)
-        return set()
-
 
 def _send_message(thread_id: str, message: str) -> dict:
     """Send a message to a Nebula thread. Returns the full API response."""
@@ -208,24 +224,115 @@ def _send_message(thread_id: str, message: str) -> dict:
     resp.raise_for_status()
     data = resp.json()
 
+    # Response: {"result": {"thread_id": "...", "message_id": "...", "status": "processing"}}
+    result = data.get("result", data)
+    msg_id = result.get("message_id", "unknown")
+    status = result.get("status", "unknown")
+
     logger.info(
-        "Message sent. Response keys: %s",
-        list(data.keys()) if isinstance(data, dict) else type(data).__name__,
+        "Message sent. ID: %s, status: %s",
+        msg_id,
+        status,
     )
     return data
 
 
-def _poll_for_response(thread_id: str, known_ids: set) -> str:
-    """Poll the thread for a new assistant message.
+def _poll_for_response_events(thread_id: str, sent_at_ms: int) -> str:
+    """Poll /events for the completed assistant response.
 
-    Compares message IDs against the set taken before we sent our message
-    to detect the new assistant reply.
+    Uses the events endpoint with filters:
+      - event_types=NebulaMessageEvent (only assistant messages)
+      - after_timestamp=sent_at_ms (only events after we sent our message)
+
+    Waits for an event with status="completed" and role="assistant".
     """
-    logger.info("Polling for response (timeout: %ss)...", POLL_TIMEOUT)
-    start_time = time.time()
+    logger.info(
+        "Polling events for thread %s (after_timestamp=%d)...",
+        thread_id,
+        sent_at_ms,
+    )
+
+    deadline = time.time() + POLL_TIMEOUT
     poll_count = 0
 
-    while time.time() - start_time < POLL_TIMEOUT:
+    while time.time() < deadline:
+        poll_count += 1
+        time.sleep(POLL_INTERVAL)
+
+        try:
+            resp = http_requests.get(
+                f"{NEBULA_API_BASE}/threads/{thread_id}/events",
+                headers=_headers(),
+                params={
+                    "event_types": "NebulaMessageEvent",
+                    "after_timestamp": sent_at_ms,
+                    "limit": 20,
+                },
+                timeout=30,
+            )
+
+            if resp.status_code != 200:
+                logger.warning(
+                    "Events poll #%d returned %d, falling back to /messages",
+                    poll_count,
+                    resp.status_code,
+                )
+                return _poll_for_response_messages(thread_id, sent_at_ms)
+
+            data = resp.json()
+
+            # Response shape: {"result": {"events": [...], "has_more": bool}}
+            result = data.get("result", {})
+            events = result.get("events", [])
+
+            logger.info(
+                "Events poll #%d: %d event(s) found", poll_count, len(events)
+            )
+
+            # Look for a completed assistant message
+            for event in events:
+                event_data = event.get("data", event)
+                role = event_data.get("role", "")
+                status = event_data.get("status", "")
+
+                if role == "assistant" and status == "completed":
+                    content = event_data.get("content", "")
+                    text = _extract_text_from_content(content)
+
+                    if text:
+                        logger.info(
+                            "Got completed response (%d chars) on poll #%d",
+                            len(text),
+                            poll_count,
+                        )
+                        return text
+
+                elif role == "assistant" and status == "streaming":
+                    logger.info(
+                        "Poll #%d: response still streaming...", poll_count
+                    )
+
+        except http_requests.exceptions.RequestException as e:
+            logger.warning("Events poll #%d failed: %s", poll_count, e)
+
+    raise TimeoutError(
+        f"No completed assistant response after {POLL_TIMEOUT}s "
+        f"({poll_count} polls)"
+    )
+
+
+def _poll_for_response_messages(thread_id: str, sent_at_ms: int) -> str:
+    """Fallback: poll /messages for the assistant response.
+
+    Used when /events returns non-200. Checks /messages and looks for
+    an assistant message created after our sent timestamp.
+    """
+    logger.info("Falling back to /messages polling for thread %s...", thread_id)
+
+    deadline = time.time() + POLL_TIMEOUT
+    poll_count = 0
+
+    while time.time() < deadline:
         poll_count += 1
         time.sleep(POLL_INTERVAL)
 
@@ -233,61 +340,53 @@ def _poll_for_response(thread_id: str, known_ids: set) -> str:
             resp = http_requests.get(
                 f"{NEBULA_API_BASE}/threads/{thread_id}/messages",
                 headers=_headers(),
-                params={"limit": 10},
+                params={"limit": 10, "sort_order": "desc"},
                 timeout=30,
             )
-            resp.raise_for_status()
+
+            if resp.status_code != 200:
+                logger.warning(
+                    "Messages poll #%d returned %d", poll_count, resp.status_code
+                )
+                continue
+
             data = resp.json()
 
-            messages = []
-            if isinstance(data, list):
-                messages = data
-            elif isinstance(data, dict):
-                messages = data.get(
-                    "messages",
-                    data.get("items", data.get("data", [])),
-                )
+            # Response shape: {"result": [...]}
+            messages = data.get("result", [])
+            if isinstance(messages, dict):
+                messages = messages.get("messages", messages.get("items", []))
 
-            # Look for new assistant messages not in our known set
-            for msg in messages:
-                msg_role = msg.get("role", "")
-                msg_content = msg.get("content", "")
-                msg_id = msg.get("id") or msg.get("message_id", "")
-
-                if (
-                    msg_role == "assistant"
-                    and msg_content
-                    and msg_content.strip()
-                    and msg_id
-                    and msg_id not in known_ids
-                ):
-                    elapsed = time.time() - start_time
-                    logger.info(
-                        "Got response after %d polls (%.1fs): %d chars",
-                        poll_count,
-                        elapsed,
-                        len(msg_content),
-                    )
-                    return msg_content
-
-        except Exception as e:
-            logger.warning("Poll %d failed: %s", poll_count, e)
-
-        if poll_count % 10 == 0:
-            elapsed = time.time() - start_time
             logger.info(
-                "Still waiting... (%d polls, %.0fs elapsed)",
-                poll_count,
-                elapsed,
+                "Messages poll #%d: %d message(s)", poll_count, len(messages)
             )
 
+            for msg in messages:
+                role = msg.get("role", "")
+                created_at = msg.get("created_at", 0)
+
+                if role == "assistant" and created_at > sent_at_ms:
+                    content = msg.get("content", "")
+                    text = _extract_text_from_content(content)
+
+                    if text:
+                        logger.info(
+                            "Got response via /messages (%d chars) on poll #%d",
+                            len(text),
+                            poll_count,
+                        )
+                        return text
+
+        except http_requests.exceptions.RequestException as e:
+            logger.warning("Messages poll #%d failed: %s", poll_count, e)
+
     raise TimeoutError(
-        f"No response after {POLL_TIMEOUT}s ({poll_count} polls)"
+        f"No assistant response via /messages after {POLL_TIMEOUT}s "
+        f"({poll_count} polls)"
     )
 
 
 # ---- OpenAI-Compatible Response Formatting ----------------------------------
-
 
 def _make_openai_response(content: str, model: str = "nebula") -> dict:
     """Format the response in OpenAI chat completion format."""
@@ -322,7 +421,8 @@ def _make_openai_error(message: str, status_code: int = 500) -> tuple:
                 "error": {
                     "message": message,
                     "type": "server_error",
-                    "code": status_code,
+                    "param": None,
+                    "code": None,
                 }
             }
         ),
@@ -331,7 +431,6 @@ def _make_openai_error(message: str, status_code: int = 500) -> tuple:
 
 
 # ---- Routes -----------------------------------------------------------------
-
 
 @app.route("/v1/chat/completions", methods=["POST"])
 def chat_completions():
@@ -355,16 +454,17 @@ def chat_completions():
         stream,
     )
 
-    # -- Step 1: Ensure we have the DM thread ---------------------------------
+    # -- Step 1: Create a fresh ephemeral thread -------------------------------
+    thread_id = None
     try:
-        thread_id = _get_dm_thread()
+        thread_id = _create_fresh_thread()
     except Exception as e:
-        logger.error("Failed to get DM thread: %s", e)
+        logger.error("Failed to create thread: %s", e)
         return _make_openai_error(f"Failed to connect to Nebula: {e}", 502)
 
-    # -- Step 2: Snapshot current message IDs ---------------------------------
-    known_ids = _get_existing_message_ids(thread_id)
-    logger.info("Thread has %d existing messages", len(known_ids))
+    # -- Step 2: Record timestamp before sending ------------------------------
+    sent_at_ms = int(time.time() * 1000)
+    logger.info("Send timestamp: %d", sent_at_ms)
 
     # -- Step 3: Format and send the message ----------------------------------
     prompt = _format_messages_for_nebula(messages)
@@ -373,18 +473,21 @@ def chat_completions():
         _send_message(thread_id, prompt)
     except Exception as e:
         logger.error("Failed to send message: %s", e)
+        _delete_thread(thread_id)  # clean up on failure too
         return _make_openai_error(
             f"Failed to send message to Nebula: {e}", 502
         )
 
     # -- Step 4: Poll for the response ----------------------------------------
     try:
-        response_content = _poll_for_response(thread_id, known_ids)
+        response_content = _poll_for_response_events(thread_id, sent_at_ms)
     except TimeoutError as e:
         logger.error("Response timeout: %s", e)
+        _delete_thread(thread_id)
         return _make_openai_error("Nebula did not respond in time", 504)
     except Exception as e:
         logger.error("Polling error: %s", e)
+        _delete_thread(thread_id)
         return _make_openai_error(
             f"Error waiting for Nebula response: {e}", 502
         )
@@ -415,7 +518,7 @@ def chat_completions():
             }
             yield f"data: {json.dumps(chunk)}\n\n"
 
-            # Stop chunk
+            # Send the stop chunk
             stop_chunk = {
                 "id": chunk_id,
                 "object": "chat.completion.chunk",
@@ -432,18 +535,25 @@ def chat_completions():
             yield f"data: {json.dumps(stop_chunk)}\n\n"
             yield "data: [DONE]\n\n"
 
+            # Clean up the thread after streaming is complete
+            _delete_thread(thread_id)
+
         return Response(
             generate_stream(),
-            mimetype="text/event-stream",
+            content_type="text/event-stream",
             headers={
                 "Cache-Control": "no-cache",
                 "X-Accel-Buffering": "no",
             },
         )
 
-    result = _make_openai_response(response_content, model)
-    logger.info("Returning response: %d chars", len(response_content))
-    return jsonify(result)
+    # Non-streaming: return full response, then clean up
+    result = jsonify(_make_openai_response(response_content, model))
+
+    # Clean up the ephemeral thread
+    _delete_thread(thread_id)
+
+    return result
 
 
 @app.route("/v1/models", methods=["GET"])
@@ -456,7 +566,7 @@ def list_models():
                 {
                     "id": "nebula",
                     "object": "model",
-                    "created": int(time.time()),
+                    "created": 1700000000,
                     "owned_by": "nebula",
                 }
             ],
@@ -470,10 +580,9 @@ def health():
     return jsonify(
         {
             "status": "ok",
-            "version": "2.0.0",
-            "architecture": "agent-dm",
+            "version": "4.0-ephemeral-threads",
             "agent_id": NEBULA_AGENT_ID,
-            "dm_thread_id": _dm_thread_id,
+            "mode": "stateless (fresh thread per request)",
         }
     )
 
@@ -481,50 +590,22 @@ def health():
 # ---- Startup ----------------------------------------------------------------
 
 if __name__ == "__main__":
+    logger.info("=" * 60)
+    logger.info("Nebula SillyTavern Proxy v4.0 (Ephemeral Threads)")
+    logger.info("=" * 60)
+    logger.info("Agent ID   : %s", NEBULA_AGENT_ID)
+    logger.info("API Base   : %s", NEBULA_API_BASE)
+    logger.info("Port       : %d", PROXY_PORT)
+    logger.info("Mode       : Stateless (fresh thread per request)")
+    logger.info("Poll       : %.1fs interval, %.0fs timeout", POLL_INTERVAL, POLL_TIMEOUT)
+    logger.info("Token      : %s...%s", NEBULA_BEARER_TOKEN[:20], NEBULA_BEARER_TOKEN[-10:])
+    logger.info("=" * 60)
+
     if not NEBULA_BEARER_TOKEN:
-        logger.error(
-            "NEBULA_BEARER_TOKEN is not set! Add it to your .env file."
-        )
-        logger.error("")
-        logger.error("To get your token:")
-        logger.error("  1. Log into nebula.gg")
-        logger.error(
-            "  2. Open Chrome DevTools (F12) -> Network tab -> XHR filter"
-        )
-        logger.error(
-            "  3. Send any message, click an api.nebula.gg request"
-        )
-        logger.error(
-            "  4. Copy the Authorization header value (after 'Bearer ')"
-        )
-        logger.error("")
-        logger.error("NOTE: The token expires after ~30 days.")
+        logger.error("NEBULA_BEARER_TOKEN is not set! Add it to .env")
         exit(1)
 
-    logger.info("=" * 60)
-    logger.info("Nebula SillyTavern Proxy v2.0 (Agent DM)")
-    logger.info("=" * 60)
-    logger.info("API Base: %s", NEBULA_API_BASE)
-    logger.info("Agent ID: %s", NEBULA_AGENT_ID)
-    logger.info(
-        "Poll interval: %ss, timeout: %ss", POLL_INTERVAL, POLL_TIMEOUT
-    )
-    logger.info("Listening on port %d", PROXY_PORT)
-    logger.info("")
-    logger.info(
-        "Point SillyTavern at: http://localhost:%d", PROXY_PORT
-    )
-    logger.info("=" * 60)
-
-    # Pre-fetch the DM thread on startup so errors are caught early
-    try:
-        thread = _get_dm_thread()
-        logger.info("Ready! DM thread: %s", thread)
-    except Exception as e:
-        logger.error("Failed to initialize DM thread: %s", e)
-        logger.error(
-            "Check your NEBULA_BEARER_TOKEN and NEBULA_AGENT_ID."
-        )
-        exit(1)
+    logger.info("Ready — each request creates a fresh thread (no shared state)")
+    logger.info("SillyTavern endpoint: http://localhost:%d/v1", PROXY_PORT)
 
     app.run(host="0.0.0.0", port=PROXY_PORT, debug=False)
