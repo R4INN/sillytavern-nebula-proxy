@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""SillyTavern <-> Nebula Proxy (v4 — Ephemeral Threads)
+"""SillyTavern <-> Nebula Proxy (v4.1 — Fixed Event Parsing)
 
 A lightweight reverse proxy that lets SillyTavern use Nebula as its AI backend.
 
@@ -206,8 +206,8 @@ def _extract_text_from_content(content) -> str:
 
 # ---- Nebula API Interaction -------------------------------------------------
 
-def _send_message(thread_id: str, message: str) -> dict:
-    """Send a message to a Nebula thread. Returns the full API response."""
+def _send_message(thread_id: str, message: str) -> str:
+    """Send a message to a Nebula thread. Returns the user_message_id."""
     logger.info(
         "Sending message to thread %s (%d chars)...", thread_id, len(message)
     )
@@ -230,26 +230,34 @@ def _send_message(thread_id: str, message: str) -> dict:
     status = result.get("status", "unknown")
 
     logger.info(
-        "Message sent. ID: %s, status: %s",
+        "Message sent. user_message_id: %s, status: %s",
         msg_id,
         status,
     )
-    return data
+    return msg_id
 
 
-def _poll_for_response_events(thread_id: str, sent_at_ms: int) -> str:
-    """Poll /events for the completed assistant response.
+def _poll_for_response_events(thread_id: str, user_message_id: str) -> str:
+    """Poll /events/{user_message_id} for the completed assistant response.
 
-    Uses the events endpoint with filters:
-      - event_types=NebulaMessageEvent (only assistant messages)
-      - after_timestamp=sent_at_ms (only events after we sent our message)
+    Uses the per-turn events endpoint which returns only events for our
+    specific message, avoiding any confusion with other events.
 
-    Waits for an event with status="completed" and role="assistant".
+    NebulaMessageEvent schema (from API spec):
+      - type: "NebulaMessageEvent"  (NOT "role" — there is no role field)
+      - status: "streaming" | "completed" | "error" | "cancelled"
+      - content: array of ChatContentType objects [{type: "text", text: "..."}]
+      - is_thinking: bool (true for reasoning tokens — skip these)
+      - is_sub_agent: bool (true for delegated agent messages — skip these)
+      - tool_call_ids: list (non-empty means tool call, not final response)
+
+    We also watch for FinalResultEvent (type: "FinalResultEvent") which
+    signals the entire turn is done.
     """
     logger.info(
-        "Polling events for thread %s (after_timestamp=%d)...",
+        "Polling events for thread %s, user_message_id=%s...",
         thread_id,
-        sent_at_ms,
+        user_message_id,
     )
 
     deadline = time.time() + POLL_TIMEOUT
@@ -260,57 +268,84 @@ def _poll_for_response_events(thread_id: str, sent_at_ms: int) -> str:
         time.sleep(POLL_INTERVAL)
 
         try:
+            # Use the per-turn endpoint for targeted results
             resp = http_requests.get(
-                f"{NEBULA_API_BASE}/threads/{thread_id}/events",
+                f"{NEBULA_API_BASE}/threads/{thread_id}/events/{user_message_id}",
                 headers=_headers(),
-                params={
-                    "event_types": "NebulaMessageEvent",
-                    "after_timestamp": sent_at_ms,
-                    "limit": 20,
-                },
                 timeout=30,
             )
 
             if resp.status_code != 200:
                 logger.warning(
-                    "Events poll #%d returned %d, falling back to /messages",
+                    "Events poll #%d returned %d, retrying...",
                     poll_count,
                     resp.status_code,
                 )
-                return _poll_for_response_messages(thread_id, sent_at_ms)
+                continue
 
             data = resp.json()
 
-            # Response shape: {"result": {"events": [...], "has_more": bool}}
+            # Response shape: {"result": {"events": [...], "usage": {...}}}
             result = data.get("result", {})
             events = result.get("events", [])
 
-            logger.info(
-                "Events poll #%d: %d event(s) found", poll_count, len(events)
-            )
+            if poll_count <= 3 or poll_count % 10 == 0:
+                logger.info(
+                    "Events poll #%d: %d event(s) found", poll_count, len(events)
+                )
 
-            # Look for a completed assistant message
+            # Scan for FinalResultEvent to know the turn is done,
+            # then extract the final NebulaMessageEvent content
+            has_final = False
+            best_text = ""
+
             for event in events:
-                event_data = event.get("data", event)
-                role = event_data.get("role", "")
-                status = event_data.get("status", "")
+                event_type = event.get("type", "")
 
-                if role == "assistant" and status == "completed":
-                    content = event_data.get("content", "")
-                    text = _extract_text_from_content(content)
+                if event_type == "FinalResultEvent":
+                    has_final = True
+                    logger.info("Poll #%d: FinalResultEvent found — turn complete", poll_count)
 
-                    if text:
-                        logger.info(
-                            "Got completed response (%d chars) on poll #%d",
-                            len(text),
-                            poll_count,
-                        )
-                        return text
+                elif event_type == "NebulaMessageEvent":
+                    status = event.get("status", "")
+                    is_thinking = event.get("is_thinking", False)
+                    is_sub_agent = event.get("is_sub_agent", False)
+                    tool_call_ids = event.get("tool_call_ids", [])
 
-                elif role == "assistant" and status == "streaming":
-                    logger.info(
-                        "Poll #%d: response still streaming...", poll_count
-                    )
+                    # Skip thinking tokens, sub-agent messages, and tool calls
+                    if is_thinking or is_sub_agent or tool_call_ids:
+                        continue
+
+                    if status == "completed":
+                        content = event.get("content", "")
+                        text = _extract_text_from_content(content)
+                        if text:
+                            best_text = text  # keep the last completed one
+
+                    elif status == "streaming":
+                        if poll_count <= 3 or poll_count % 10 == 0:
+                            logger.info(
+                                "Poll #%d: response still streaming...", poll_count
+                            )
+
+            # If we found the final event and have text, we're done
+            if has_final and best_text:
+                logger.info(
+                    "Got completed response (%d chars) on poll #%d",
+                    len(best_text),
+                    poll_count,
+                )
+                return best_text
+
+            # Even without FinalResultEvent, if we have completed text, return it
+            # (FinalResultEvent might arrive slightly later)
+            if best_text and poll_count >= 3:
+                logger.info(
+                    "Got completed response (%d chars) on poll #%d (no FinalResultEvent yet, proceeding anyway)",
+                    len(best_text),
+                    poll_count,
+                )
+                return best_text
 
         except http_requests.exceptions.RequestException as e:
             logger.warning("Events poll #%d failed: %s", poll_count, e)
@@ -321,11 +356,11 @@ def _poll_for_response_events(thread_id: str, sent_at_ms: int) -> str:
     )
 
 
-def _poll_for_response_messages(thread_id: str, sent_at_ms: int) -> str:
+def _poll_for_response_messages(thread_id: str) -> str:
     """Fallback: poll /messages for the assistant response.
 
-    Used when /events returns non-200. Checks /messages and looks for
-    an assistant message created after our sent timestamp.
+    Used if the per-turn events endpoint is unavailable. Since we use
+    ephemeral threads, any assistant message in the thread is our response.
     """
     logger.info("Falling back to /messages polling for thread %s...", thread_id)
 
@@ -363,9 +398,8 @@ def _poll_for_response_messages(thread_id: str, sent_at_ms: int) -> str:
 
             for msg in messages:
                 role = msg.get("role", "")
-                created_at = msg.get("created_at", 0)
 
-                if role == "assistant" and created_at > sent_at_ms:
+                if role == "assistant":
                     content = msg.get("content", "")
                     text = _extract_text_from_content(content)
 
@@ -462,15 +496,11 @@ def chat_completions():
         logger.error("Failed to create thread: %s", e)
         return _make_openai_error(f"Failed to connect to Nebula: {e}", 502)
 
-    # -- Step 2: Record timestamp before sending ------------------------------
-    sent_at_ms = int(time.time() * 1000)
-    logger.info("Send timestamp: %d", sent_at_ms)
-
-    # -- Step 3: Format and send the message ----------------------------------
+    # -- Step 2: Format and send the message ----------------------------------
     prompt = _format_messages_for_nebula(messages)
 
     try:
-        _send_message(thread_id, prompt)
+        user_message_id = _send_message(thread_id, prompt)
     except Exception as e:
         logger.error("Failed to send message: %s", e)
         _delete_thread(thread_id)  # clean up on failure too
@@ -478,9 +508,9 @@ def chat_completions():
             f"Failed to send message to Nebula: {e}", 502
         )
 
-    # -- Step 4: Poll for the response ----------------------------------------
+    # -- Step 3: Poll for the response ----------------------------------------
     try:
-        response_content = _poll_for_response_events(thread_id, sent_at_ms)
+        response_content = _poll_for_response_events(thread_id, user_message_id)
     except TimeoutError as e:
         logger.error("Response timeout: %s", e)
         _delete_thread(thread_id)
@@ -580,7 +610,7 @@ def health():
     return jsonify(
         {
             "status": "ok",
-            "version": "4.0-ephemeral-threads",
+            "version": "4.1-fixed-event-parsing",
             "agent_id": NEBULA_AGENT_ID,
             "mode": "stateless (fresh thread per request)",
         }
@@ -591,7 +621,7 @@ def health():
 
 if __name__ == "__main__":
     logger.info("=" * 60)
-    logger.info("Nebula SillyTavern Proxy v4.0 (Ephemeral Threads)")
+    logger.info("Nebula SillyTavern Proxy v4.1 (Fixed Event Parsing)")
     logger.info("=" * 60)
     logger.info("Agent ID   : %s", NEBULA_AGENT_ID)
     logger.info("API Base   : %s", NEBULA_API_BASE)
